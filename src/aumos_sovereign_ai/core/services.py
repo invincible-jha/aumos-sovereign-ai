@@ -17,11 +17,19 @@ from aumos_common.observability import get_logger
 
 from aumos_sovereign_ai.adapters.kafka import SovereignEventPublisher
 from aumos_sovereign_ai.core.interfaces import (
+    IComplianceAuditor,
     IComplianceMapRepository,
+    IDataSovereigntyEnforcer,
+    IEncryptionKeyManager,
+    IJurisdictionRouter,
+    ILocalModelDeployer,
+    IOfflineRuntime,
+    IRegionalDeployer,
     IRegionalDeploymentRepository,
     IResidencyRuleRepository,
     IRoutingPolicyRepository,
     ISovereignModelRepository,
+    ISovereignRegistry,
 )
 from aumos_sovereign_ai.core.models import (
     ComplianceMap,
@@ -858,10 +866,854 @@ class SovereignRegistryService:
         return updated
 
 
+class DataSovereigntyService:
+    """Orchestrate data sovereignty enforcement and cross-border transfer control.
+
+    Delegates to the IDataSovereigntyEnforcer adapter and publishes Kafka events
+    when violations are detected or rules are defined.
+
+    Args:
+        enforcer: Data sovereignty enforcement adapter.
+        publisher: Kafka event publisher for sovereignty events.
+    """
+
+    def __init__(
+        self,
+        enforcer: IDataSovereigntyEnforcer,
+        publisher: SovereignEventPublisher,
+    ) -> None:
+        """Initialize DataSovereigntyService.
+
+        Args:
+            enforcer: Data sovereignty enforcement adapter.
+            publisher: Domain event publisher.
+        """
+        self._enforcer = enforcer
+        self._publisher = publisher
+
+    async def enforce_transfer(
+        self,
+        source_jurisdiction: str,
+        target_jurisdiction: str,
+        data_classification: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Check and enforce cross-border data transfer rules.
+
+        Args:
+            source_jurisdiction: Origin jurisdiction (ISO 3166-1 alpha-2).
+            target_jurisdiction: Destination jurisdiction.
+            data_classification: Data classification tier.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Transfer enforcement result dict with allowed status and conditions.
+        """
+        result = await self._enforcer.check_cross_border_transfer(
+            source_jurisdiction=source_jurisdiction,
+            target_jurisdiction=target_jurisdiction,
+            data_classification=data_classification,
+            tenant=tenant,
+        )
+
+        if not result.get("transfer_allowed", True):
+            await self._publisher.publish_residency_violation(
+                tenant_id=tenant.tenant_id,
+                jurisdiction=source_jurisdiction,
+                data_region=target_jurisdiction,
+                action="block_transfer",
+                correlation_id=str(uuid.uuid4()),
+            )
+
+        logger.info(
+            "Cross-border transfer enforcement complete",
+            source_jurisdiction=source_jurisdiction,
+            target_jurisdiction=target_jurisdiction,
+            allowed=result.get("transfer_allowed"),
+            tenant_id=str(tenant.tenant_id),
+        )
+        return result
+
+    async def define_rule(
+        self,
+        jurisdiction: str,
+        data_classification: str,
+        allowed_regions: list[str],
+        blocked_regions: list[str],
+        tenant: TenantContext,
+    ) -> dict:
+        """Define a data sovereignty enforcement rule.
+
+        Args:
+            jurisdiction: Target jurisdiction.
+            data_classification: Data classification this rule applies to.
+            allowed_regions: Regions where data may reside.
+            blocked_regions: Regions explicitly disallowed.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Newly created rule dict.
+        """
+        rule = await self._enforcer.define_jurisdiction_rule(
+            jurisdiction=jurisdiction,
+            data_classification=data_classification,
+            allowed_regions=allowed_regions,
+            blocked_regions=blocked_regions,
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_residency_rule_created(
+            tenant_id=tenant.tenant_id,
+            rule_id=uuid.UUID(rule.get("rule_id", str(uuid.uuid4()))),
+            jurisdiction=jurisdiction,
+            correlation_id=str(uuid.uuid4()),
+        )
+
+        logger.info(
+            "Sovereignty rule defined",
+            jurisdiction=jurisdiction,
+            data_classification=data_classification,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return rule
+
+    async def get_violations(self, tenant: TenantContext) -> list[dict]:
+        """Detect and return current sovereignty violations.
+
+        Args:
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            List of violation dicts.
+        """
+        return await self._enforcer.detect_violations(tenant)
+
+    async def get_audit_trail(
+        self,
+        tenant: TenantContext,
+        *,
+        jurisdiction: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Retrieve the sovereignty enforcement audit trail.
+
+        Args:
+            tenant: Tenant context for RLS isolation.
+            jurisdiction: Optional jurisdiction filter.
+            limit: Maximum number of audit records to return.
+
+        Returns:
+            List of audit trail dicts.
+        """
+        return await self._enforcer.get_audit_trail(
+            tenant, jurisdiction=jurisdiction, limit=limit
+        )
+
+
+class LocalModelService:
+    """Orchestrate on-premise model deployment and offline execution lifecycle.
+
+    Delegates to ILocalModelDeployer and IOfflineRuntime adapters and publishes
+    Kafka events on model cache and deployment state changes.
+
+    Args:
+        deployer: Local model deployment adapter.
+        offline_runtime: Air-gapped inference runtime adapter.
+        publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        deployer: ILocalModelDeployer,
+        offline_runtime: IOfflineRuntime,
+        publisher: SovereignEventPublisher,
+    ) -> None:
+        """Initialize LocalModelService.
+
+        Args:
+            deployer: Local model deployment adapter.
+            offline_runtime: Air-gapped inference runtime adapter.
+            publisher: Domain event publisher.
+        """
+        self._deployer = deployer
+        self._offline_runtime = offline_runtime
+        self._publisher = publisher
+
+    async def download_and_prepare(
+        self,
+        model_id: str,
+        model_version: str,
+        source_registry_url: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Download a model to the local cache and prepare it for offline use.
+
+        Args:
+            model_id: Model to download.
+            model_version: Specific version to cache.
+            source_registry_url: Source model registry URL.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Cache result dict with cache_path and model fingerprint.
+        """
+        result = await self._deployer.download_and_cache_model(
+            model_id=model_id,
+            model_version=model_version,
+            source_registry_url=source_registry_url,
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_sovereign_model_registered(
+            tenant_id=tenant.tenant_id,
+            model_reg_id=uuid.UUID(result.get("cache_id", str(uuid.uuid4()))),
+            model_id=model_id,
+            jurisdiction=result.get("cached_jurisdiction", "LOCAL"),
+            correlation_id=str(uuid.uuid4()),
+        )
+
+        logger.info(
+            "Model downloaded and cached",
+            model_id=model_id,
+            model_version=model_version,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return result
+
+    async def generate_manifest(
+        self,
+        model_id: str,
+        model_version: str,
+        namespace: str,
+        resource_config: dict,
+        tenant: TenantContext,
+    ) -> dict:
+        """Generate a Kubernetes deployment manifest for a local model.
+
+        Args:
+            model_id: Model to deploy.
+            model_version: Version to deploy.
+            namespace: Kubernetes namespace.
+            resource_config: Resource limits and replica configuration.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            K8s Deployment manifest dict (apps/v1).
+        """
+        return await self._deployer.generate_deployment_manifest(
+            model_id=model_id,
+            model_version=model_version,
+            namespace=namespace,
+            resource_config=resource_config,
+            tenant=tenant,
+        )
+
+    async def run_offline_inference(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        tenant: TenantContext,
+    ) -> dict:
+        """Execute inference on a locally cached model in air-gapped mode.
+
+        Args:
+            model_id: Model to run inference on.
+            prompt: Input prompt text.
+            max_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Inference result dict with generated text and latency metrics.
+        """
+        result = await self._offline_runtime.run_local_inference(
+            model_id=model_id,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tenant=tenant,
+        )
+
+        logger.info(
+            "Offline inference completed",
+            model_id=model_id,
+            tokens_generated=result.get("tokens_generated", 0),
+            latency_ms=result.get("latency_ms", 0),
+            tenant_id=str(tenant.tenant_id),
+        )
+        return result
+
+    async def get_offline_health(self, tenant: TenantContext) -> dict:
+        """Check the health of the offline inference runtime.
+
+        Args:
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Health status dict with loaded models and runtime status.
+        """
+        return await self._offline_runtime.check_offline_health(tenant)
+
+    async def list_cached_models(self, tenant: TenantContext) -> list[dict]:
+        """List all models available in the local cache.
+
+        Args:
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            List of cached model dicts.
+        """
+        return await self._offline_runtime.list_cached_models(tenant)
+
+
+class KeyManagementService:
+    """Orchestrate sovereign encryption key lifecycle and BYOK operations.
+
+    Wraps IEncryptionKeyManager and publishes Kafka events on key state changes
+    (import, rotation, revocation).
+
+    Args:
+        key_manager: Encryption key management adapter.
+        publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        key_manager: IEncryptionKeyManager,
+        publisher: SovereignEventPublisher,
+    ) -> None:
+        """Initialize KeyManagementService.
+
+        Args:
+            key_manager: Sovereign key management adapter.
+            publisher: Domain event publisher.
+        """
+        self._key_manager = key_manager
+        self._publisher = publisher
+
+    async def import_customer_key(
+        self,
+        key_id: str,
+        algorithm: str,
+        key_material: str,
+        jurisdiction: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Import a customer-provided encryption key (BYOK).
+
+        Args:
+            key_id: Customer-assigned key identifier.
+            algorithm: Key algorithm (AES-256 | RSA-4096 | ECDSA-P384).
+            key_material: Base64-encoded key material.
+            jurisdiction: Jurisdiction governing this key.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Key import result with fingerprint and status.
+        """
+        result = await self._key_manager.import_key(
+            key_id=key_id,
+            algorithm=algorithm,
+            key_material=key_material,
+            jurisdiction=jurisdiction,
+            tenant=tenant,
+        )
+
+        logger.info(
+            "Customer key imported",
+            key_id=key_id,
+            algorithm=algorithm,
+            jurisdiction=jurisdiction,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return result
+
+    async def rotate_key(self, key_id: str, tenant: TenantContext) -> dict:
+        """Rotate an encryption key and invalidate the previous version.
+
+        Args:
+            key_id: Key to rotate.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Rotation result with new key version and migration status.
+        """
+        result = await self._key_manager.rotate_key(key_id, tenant)
+
+        logger.info(
+            "Key rotated",
+            key_id=key_id,
+            new_version=result.get("new_version"),
+            tenant_id=str(tenant.tenant_id),
+        )
+        return result
+
+    async def revoke_key(
+        self, key_id: str, reason: str, tenant: TenantContext
+    ) -> dict:
+        """Revoke an encryption key immediately.
+
+        Args:
+            key_id: Key to revoke.
+            reason: Revocation reason for audit purposes.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Revocation result with effective timestamp.
+
+        Raises:
+            NotFoundError: If the key does not exist.
+        """
+        result = await self._key_manager.revoke_key(key_id=key_id, reason=reason, tenant=tenant)
+
+        logger.info(
+            "Key revoked",
+            key_id=key_id,
+            reason=reason,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return result
+
+    async def get_key_lifecycle(self, key_id: str, tenant: TenantContext) -> dict:
+        """Retrieve full lifecycle history for an encryption key.
+
+        Args:
+            key_id: Key identifier.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Lifecycle dict with state history, rotation schedule, and usage stats.
+        """
+        return await self._key_manager.get_key_lifecycle(key_id, tenant)
+
+
+class SovereignComplianceService:
+    """Orchestrate jurisdiction compliance audits and checklist verification.
+
+    Wraps IComplianceAuditor and persists results via the compliance map
+    repository for cross-service visibility.
+
+    Args:
+        auditor: Compliance auditing adapter.
+        compliance_repo: ComplianceMap persistence.
+        publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        auditor: IComplianceAuditor,
+        compliance_repo: IComplianceMapRepository,
+        publisher: SovereignEventPublisher,
+    ) -> None:
+        """Initialize SovereignComplianceService.
+
+        Args:
+            auditor: Compliance auditing adapter.
+            compliance_repo: Compliance map repository.
+            publisher: Domain event publisher.
+        """
+        self._auditor = auditor
+        self._compliance_repo = compliance_repo
+        self._publisher = publisher
+
+    async def run_audit(
+        self,
+        jurisdiction: str,
+        deployment_config: dict,
+        tenant: TenantContext,
+    ) -> dict:
+        """Run a compliance checklist audit for a jurisdiction.
+
+        Args:
+            jurisdiction: Jurisdiction to audit (ISO 3166-1 alpha-2 or EU/APAC).
+            deployment_config: Deployment configuration to evaluate.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Audit result dict with compliance_score, status, and findings.
+        """
+        audit_result = await self._auditor.run_compliance_check(
+            jurisdiction=jurisdiction,
+            deployment_config=deployment_config,
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_compliance_mapping_created(
+            tenant_id=tenant.tenant_id,
+            mapping_id=uuid.UUID(audit_result.get("audit_id", str(uuid.uuid4()))),
+            jurisdiction=jurisdiction,
+            regulation_name=audit_result.get("framework", "UNKNOWN"),
+            correlation_id=str(uuid.uuid4()),
+        )
+
+        logger.info(
+            "Compliance audit completed",
+            jurisdiction=jurisdiction,
+            compliance_score=audit_result.get("compliance_score"),
+            status=audit_result.get("status"),
+            tenant_id=str(tenant.tenant_id),
+        )
+        return audit_result
+
+    async def verify_residency(
+        self,
+        jurisdiction: str,
+        data_regions: list[str],
+        tenant: TenantContext,
+    ) -> dict:
+        """Verify that data regions satisfy residency requirements for a jurisdiction.
+
+        Args:
+            jurisdiction: Jurisdiction whose residency requirements to validate.
+            data_regions: List of cloud regions to check.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Verification dict with compliant status and region-by-region results.
+        """
+        return await self._auditor.verify_data_residency(
+            jurisdiction=jurisdiction,
+            data_regions=data_regions,
+            tenant=tenant,
+        )
+
+    async def get_audit_report(
+        self,
+        jurisdiction: str,
+        audit_id: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Retrieve a formatted compliance audit report.
+
+        Args:
+            jurisdiction: Jurisdiction of the audit.
+            audit_id: Unique audit identifier.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Formatted audit report dict suitable for regulatory submission.
+        """
+        return await self._auditor.generate_audit_report(
+            jurisdiction=jurisdiction,
+            audit_id=audit_id,
+            tenant=tenant,
+        )
+
+
+class SovereignRoutingService:
+    """Orchestrate jurisdiction detection and sovereign model routing.
+
+    Wraps IJurisdictionRouter, augmenting route decisions with event publishing
+    and delegating to IRegionalDeployer for multi-region deployment management.
+
+    Args:
+        router: Jurisdiction routing adapter.
+        regional_deployer: Multi-region deployment adapter.
+        publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        router: IJurisdictionRouter,
+        regional_deployer: IRegionalDeployer,
+        publisher: SovereignEventPublisher,
+    ) -> None:
+        """Initialize SovereignRoutingService.
+
+        Args:
+            router: Jurisdiction routing adapter.
+            regional_deployer: Multi-region deployer adapter.
+            publisher: Domain event publisher.
+        """
+        self._router = router
+        self._regional_deployer = regional_deployer
+        self._publisher = publisher
+
+    async def detect_and_route(
+        self,
+        model_id: str,
+        *,
+        jwt_claims: dict | None = None,
+        http_headers: dict | None = None,
+        source_ip: str | None = None,
+        tenant: TenantContext,
+    ) -> dict:
+        """Detect request origin jurisdiction and resolve the routing target.
+
+        Args:
+            model_id: Model requested for inference.
+            jwt_claims: Optional JWT payload containing jurisdiction claims.
+            http_headers: Optional HTTP request headers.
+            source_ip: Optional client IP address.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Full routing decision dict with jurisdiction, selected_region,
+            and confidence.
+        """
+        origin = await self._router.detect_request_origin(
+            jwt_claims=jwt_claims,
+            http_headers=http_headers,
+            source_ip=source_ip,
+        )
+        jurisdiction = origin.get("jurisdiction", "US")
+
+        routing = await self._router.evaluate_routing_rules(
+            jurisdiction=jurisdiction,
+            model_id=model_id,
+            tenant=tenant,
+        )
+
+        if not routing.get("routed", False):
+            routing = await self._router.apply_fallback_routing(
+                jurisdiction=jurisdiction,
+                model_id=model_id,
+                tenant=tenant,
+            )
+
+        selected_region = routing.get("selected_region", "")
+        await self._router.log_routing_decision(
+            jurisdiction=jurisdiction,
+            model_id=model_id,
+            selected_region=selected_region,
+            routing_method=routing.get("routing_method", "unknown"),
+            confidence=origin.get("confidence", 0.5),
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_routing_decision(
+            tenant_id=tenant.tenant_id,
+            jurisdiction=jurisdiction,
+            deployment_id=uuid.UUID(routing.get("deployment_id", str(uuid.uuid4()))),
+            model_id=model_id,
+            correlation_id=str(uuid.uuid4()),
+        )
+
+        logger.info(
+            "Sovereign routing decision",
+            jurisdiction=jurisdiction,
+            model_id=model_id,
+            selected_region=selected_region,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return {**origin, **routing}
+
+    async def deploy_to_regions(
+        self,
+        regions: list[str],
+        jurisdiction: str,
+        model_id: str,
+        model_version: str,
+        tenant: TenantContext,
+    ) -> list[dict]:
+        """Deploy a model across multiple sovereign regions for a jurisdiction.
+
+        Args:
+            regions: Target cloud regions.
+            jurisdiction: Governing jurisdiction for this deployment.
+            model_id: Model to deploy.
+            model_version: Model version.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            List of per-region deployment result dicts.
+        """
+        results = await self._regional_deployer.deploy_multi_region(
+            regions=regions,
+            jurisdiction=jurisdiction,
+            model_id=model_id,
+            model_version=model_version,
+            tenant=tenant,
+        )
+
+        for result in results:
+            await self._publisher.publish_deployment_initiated(
+                tenant_id=tenant.tenant_id,
+                deployment_id=uuid.UUID(result.get("deployment_id", str(uuid.uuid4()))),
+                region=result.get("region", ""),
+                jurisdiction=jurisdiction,
+                correlation_id=str(uuid.uuid4()),
+            )
+
+        logger.info(
+            "Multi-region sovereign deployment initiated",
+            regions=regions,
+            jurisdiction=jurisdiction,
+            model_id=model_id,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return results
+
+    async def get_routing_analytics(self, tenant: TenantContext) -> dict:
+        """Retrieve routing analytics and decision distribution metrics.
+
+        Args:
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Analytics dict with per-jurisdiction routing distributions.
+        """
+        return await self._router.get_routing_analytics(tenant)
+
+
+class ModelRegistryService:
+    """Orchestrate per-jurisdiction sovereign model registry operations.
+
+    Combines ISovereignRegistry operations with Kafka event publishing and
+    the existing ISovereignModelRepository for cross-service model approval.
+
+    Args:
+        registry: Sovereign model registry adapter.
+        model_repo: Sovereign model ORM repository.
+        publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        registry: ISovereignRegistry,
+        model_repo: ISovereignModelRepository,
+        publisher: SovereignEventPublisher,
+    ) -> None:
+        """Initialize ModelRegistryService.
+
+        Args:
+            registry: Sovereign model registry adapter.
+            model_repo: Sovereign model repository.
+            publisher: Domain event publisher.
+        """
+        self._registry = registry
+        self._model_repo = model_repo
+        self._publisher = publisher
+
+    async def register_and_certify(
+        self,
+        model_id: str,
+        model_version: str,
+        jurisdiction: str,
+        compliance_tags: list[str],
+        certification_framework: str,
+        certified_by: str,
+        tenant: TenantContext,
+    ) -> dict:
+        """Register a model and immediately certify it in a single workflow.
+
+        Args:
+            model_id: Model identifier.
+            model_version: Specific version to register.
+            jurisdiction: Target jurisdiction.
+            compliance_tags: Applicable compliance framework tags.
+            certification_framework: Standard being certified under.
+            certified_by: Certifier identity.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Combined registration and certification result dict.
+        """
+        registration = await self._registry.register_model(
+            model_id=model_id,
+            model_version=model_version,
+            jurisdiction=jurisdiction,
+            compliance_tags=compliance_tags,
+            tenant=tenant,
+        )
+
+        certification = await self._registry.certify_model(
+            model_id=model_id,
+            model_version=model_version,
+            jurisdiction=jurisdiction,
+            framework=certification_framework,
+            certified_by=certified_by,
+            tenant=tenant,
+        )
+
+        await self._publisher.publish_sovereign_model_registered(
+            tenant_id=tenant.tenant_id,
+            model_reg_id=uuid.UUID(registration.get("registry_id", str(uuid.uuid4()))),
+            model_id=model_id,
+            jurisdiction=jurisdiction,
+            correlation_id=str(uuid.uuid4()),
+        )
+
+        logger.info(
+            "Model registered and certified in sovereign registry",
+            model_id=model_id,
+            model_version=model_version,
+            jurisdiction=jurisdiction,
+            framework=certification_framework,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return {**registration, "certification": certification}
+
+    async def query_registry(
+        self,
+        *,
+        jurisdiction: str | None = None,
+        compliance_tag: str | None = None,
+        tenant: TenantContext,
+    ) -> list[dict]:
+        """Query the sovereign model registry with optional filters.
+
+        Args:
+            jurisdiction: Optional jurisdiction filter.
+            compliance_tag: Optional compliance tag filter.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            List of matching registry entry dicts.
+        """
+        return await self._registry.query_registry(
+            jurisdiction=jurisdiction,
+            compliance_tag=compliance_tag,
+            tenant=tenant,
+        )
+
+    async def get_certifications(
+        self, model_id: str, jurisdiction: str, tenant: TenantContext
+    ) -> list[dict]:
+        """Retrieve all certifications for a model in a jurisdiction.
+
+        Args:
+            model_id: Model identifier.
+            jurisdiction: Target jurisdiction.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            List of certification dicts.
+        """
+        return await self._registry.get_certifications(
+            model_id=model_id, jurisdiction=jurisdiction, tenant=tenant
+        )
+
+    async def synchronize_registry(
+        self, source_jurisdiction: str, tenant: TenantContext
+    ) -> dict:
+        """Synchronize registry entries from a source jurisdiction.
+
+        Args:
+            source_jurisdiction: Jurisdiction to pull updates from.
+            tenant: Tenant context for RLS isolation.
+
+        Returns:
+            Synchronization result dict with synced_count and conflicts.
+        """
+        return await self._registry.synchronize_registry(
+            source_jurisdiction=source_jurisdiction, tenant=tenant
+        )
+
+
 __all__ = [
     "ComplianceMapperService",
+    "DataSovereigntyService",
     "GeopatriationService",
     "JurisdictionRouterService",
+    "KeyManagementService",
+    "LocalModelService",
+    "ModelRegistryService",
     "RegionalDeployerService",
+    "SovereignComplianceService",
     "SovereignRegistryService",
+    "SovereignRoutingService",
 ]

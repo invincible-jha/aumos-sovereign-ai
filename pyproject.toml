@@ -24,6 +24,7 @@ dependencies = [
     "fastapi>=0.110.0",
     "pydantic>=2.6.0",
     "uvicorn[standard]>=0.27.0",
+    "httpx>=0.27.0",
     # kubernetes-asyncio for K8s regional deployment management
     "kubernetes-asyncio>=24.2.0",
 ]
